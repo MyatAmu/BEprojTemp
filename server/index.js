@@ -1,0 +1,997 @@
+const express = require('express');
+const fs = require('fs');
+const path = require('path');
+const cors = require('cors');
+const bodyParser = require('body-parser');
+const axios = require('axios');
+const http = require('http');
+const { Server } = require('socket.io');
+const rateLimit = require('express-rate-limit');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcrypt');
+
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server, {
+    cors: {
+        origin: "*", // allow dashboard URL
+        methods: ["GET", "POST"]
+    }
+});
+
+const PORT = 5002;
+const LOG_FILE = path.join(__dirname, 'server_logs.json');      // Legacy JSON
+const JSONL_FILE = path.join(__dirname, 'server_logs.jsonl');   // New JSONL format
+const DEVICES_FILE = path.join(__dirname, 'devices.json');      // Device registry
+const DEVICE_LOGS_DIR = path.join(__dirname, 'logs_per_device'); // Individual device logs
+
+// Ensure logs directory exists
+if (!fs.existsSync(DEVICE_LOGS_DIR)) {
+    fs.mkdirSync(DEVICE_LOGS_DIR, { recursive: true });
+}
+
+// Heartbeat tracking
+let deviceHeartbeats = {};
+const HEARTBEAT_TIMEOUT = 45000; // 45 seconds
+
+// Alarm State
+let isAlarmActive = false;
+let alarmReason = "";
+
+// In-Memory Log Cache (for low-latency dashboard polling)
+let recentLogs = [];
+let cacheInitialized = false;
+const MAX_CACHE_SIZE = 200;
+
+// Trust Score Cache (for instant control)
+let trustScoreCache = {};
+const TRUST_CACHE_TTL = 300000; // 5 minutes (in ms)
+
+// --- Setup Middlewares & Protection ---
+app.use(cors());
+app.use(bodyParser.json());
+
+// Global API Rate Limiting: max 5000 requests per 1 minute (Allows Gateway)
+const apiLimiter = rateLimit({
+    windowMs: 1 * 60 * 1000,
+    max: 5000,
+    message: { error: "Too many requests from this IP, please try again later" },
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+// Apply rate limiter specifically to the API paths
+app.use('/api/', apiLimiter);
+
+// --- JWT Authentication Implementation ---
+const PRIVATE_KEY = fs.existsSync(path.join(__dirname, 'jwt_private.pem')) ? fs.readFileSync(path.join(__dirname, 'jwt_private.pem'), 'utf8') : null;
+const PUBLIC_KEY = fs.existsSync(path.join(__dirname, 'jwt_public.pem')) ? fs.readFileSync(path.join(__dirname, 'jwt_public.pem'), 'utf8') : null;
+
+if (!PRIVATE_KEY || !PUBLIC_KEY) {
+    console.warn("⚠️ [SECURITY WARNING] JWT Keys not found! API is running in INSECURE mode. Run 'node generate_keys.js' to fix.");
+}
+
+// Generate simple hashed mock user for demo
+const MOCK_ADMIN_HASH = bcrypt.hashSync("admin123", 10);
+const MOCK_GATEWAY_HASH = bcrypt.hashSync("gateway_secret", 10);
+
+app.post('/api/login', (req, res) => {
+    const { username, password } = req.body;
+
+    if (!PRIVATE_KEY) return res.status(500).json({ error: "Server missing JWT keys" });
+
+    let role = null;
+    let valid = false;
+
+    if (username === 'admin' && bcrypt.compareSync(password, MOCK_ADMIN_HASH)) {
+        role = 'dashboard_admin';
+        valid = true;
+    } else if (username === 'gateway' && bcrypt.compareSync(password, MOCK_GATEWAY_HASH)) {
+        role = 'gateway_node';
+        valid = true;
+    }
+
+    if (valid) {
+        const token = jwt.sign({ username, role }, PRIVATE_KEY, { algorithm: 'RS256', expiresIn: '12h' });
+        res.json({ token, role });
+    } else {
+        res.status(401).json({ error: "Invalid credentials" });
+    }
+});
+
+const authenticateToken = (req, res, next) => {
+    // Exempt login and health checks
+    if (!PUBLIC_KEY) return next(); // Bypass if missing keys (for local dev)
+    const openPaths = ['/api/login', '/api/health', '/login', '/health', '/api/alerts', '/alerts', '/api/alarm/trigger', '/alarm/trigger'];
+    if (openPaths.includes(req.path) || req.path.endsWith('/unquarantine')) return next();
+
+    // Check auth header
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1]; // Bearer <token>
+
+    if (!token) {
+        console.warn(`[AUTH] Blocked unauthorized request to ${req.path}`);
+        return res.status(401).json({ error: "Access denied. Token missing." });
+    }
+
+    jwt.verify(token, PUBLIC_KEY, { algorithms: ['RS256'] }, (err, user) => {
+        if (err) {
+            console.warn(`[AUTH] Invalid token used for ${req.path}`);
+            return res.status(403).json({ error: "Invalid or expired token" });
+        }
+        req.user = user;
+        next();
+    });
+};
+
+// Global application of token verification
+app.use('/api', authenticateToken);
+
+// --- WebSocket Connection Handler ---
+io.on('connection', (socket) => {
+    console.log(`[WSS] New client connected: ${socket.id}`);
+
+    // Optionally send immediate current state to new clients
+    socket.emit('initial_state', {
+        alarm_active: isAlarmActive,
+        alarm_reason: alarmReason
+    });
+
+    socket.on('disconnect', () => {
+        console.log(`[WSS] Client disconnected: ${socket.id}`);
+    });
+});
+
+
+// Helper to read logs (from JSONL)
+const readLogs = () => {
+    // Try JSONL first (new format)
+    if (fs.existsSync(JSONL_FILE)) {
+        try {
+            const data = fs.readFileSync(JSONL_FILE, 'utf8');
+            const lines = data.trim().split('\n').filter(line => line.trim());
+            return lines.map(line => {
+                try {
+                    return JSON.parse(line);
+                } catch (e) {
+                    return null;
+                }
+            }).filter(item => item !== null);
+        } catch (err) {
+            console.error('[SERVER] Error reading JSONL:', err.message);
+        }
+    }
+    // Fallback to legacy JSON
+    if (fs.existsSync(LOG_FILE)) {
+        try {
+            const data = fs.readFileSync(LOG_FILE, 'utf8');
+            return JSON.parse(data);
+        } catch (err) {
+            return [];
+        }
+    }
+    return [];
+};
+
+// Helper to append logs (Per-device JSON files + General JSONL)
+const appendLogs = (logs, gatewayId, batchId, batchHash) => {
+    const dateNow = new Date();
+    const dateStr = dateNow.toISOString().split('T')[0];
+    const timeStr = dateNow.toTimeString().split(' ')[0];
+
+    // 1. Original JSONL Append (General Audit) & Cache Update
+    const now = Date.now();
+
+    const lines = logs.map(log => {
+        const enrichedLog = {
+            ...log,
+            gateway_id: gatewayId,
+            batch_id: batchId,
+            batch_hash: batchHash,
+            server_received_at: now
+        };
+
+        // Always push to live cache — the cacheInitialized flag in GET /api/logs
+        // already prevents stale JSONL data from polluting the dashboard on startup
+        recentLogs.push(enrichedLog);
+        if (recentLogs.length > MAX_CACHE_SIZE) {
+            recentLogs.shift();
+        }
+
+        // --- EMIT REAL-TIME WEBSOCKET EVENT ---
+        io.emit('new_log', enrichedLog);
+
+        return JSON.stringify(enrichedLog);
+    }).join('\n') + '\n';
+    fs.appendFileSync(JSONL_FILE, lines);
+
+    // 2. Per-Device JSON Array Storage (User's database request)
+    logs.forEach(log => {
+        if (!log.device_id) return;
+
+        const deviceId = log.device_id;
+        const filePath = path.join(DEVICE_LOGS_DIR, `${deviceId}.json`);
+
+        const logEntry = {
+            date: dateStr,
+            time: timeStr,
+            device_id: deviceId,
+            score: log.anomaly_score || 1.0, // Use score from log if present
+            values: {
+                ...(log.sensors || {}),
+                ...(log.system || {})
+            },
+            gateway_id: gatewayId,
+            batch_hash: batchHash
+        };
+
+        try {
+            let deviceLogs = [];
+            if (fs.existsSync(filePath)) {
+                const content = fs.readFileSync(filePath, 'utf8');
+                deviceLogs = JSON.parse(content);
+            }
+            deviceLogs.push(logEntry);
+
+            // Keep last 500 entries to prevent files growing too large
+            if (deviceLogs.length > 500) {
+                deviceLogs = deviceLogs.slice(-500);
+            }
+
+            fs.writeFileSync(filePath, JSON.stringify(deviceLogs, null, 2));
+        } catch (err) {
+            console.error(`[SERVER] Error writing device log for ${deviceId}:`, err.message);
+        }
+    });
+};
+
+// Helper to prune old logs (keep last N lines)
+const pruneLogs = (maxLines = 1000) => {
+    if (!fs.existsSync(JSONL_FILE)) return;
+
+    try {
+        const data = fs.readFileSync(JSONL_FILE, 'utf8');
+        const lines = data.trim().split('\n').filter(line => line.trim());
+        if (lines.length > maxLines) {
+            const prunedLines = lines.slice(-maxLines);
+            fs.writeFileSync(JSONL_FILE, prunedLines.join('\n') + '\n');
+            console.log(`[SERVER] Pruned logs to ${maxLines} entries`);
+        }
+    } catch (err) {
+        console.error('[SERVER] Error pruning logs:', err.message);
+    }
+};
+
+// API: Receive Batch from Gateway
+app.post('/api/logs', (req, res) => {
+    const batch = req.body;
+
+    if (!batch || !batch.logs) {
+        return res.status(400).json({ error: "Invalid batch format" });
+    }
+
+    // Identify the gateway. If using JWT, we trust the token identity over the payload.
+    const gatewayId = (req.user && req.user.role === 'gateway_node') ? req.user.username : (batch.gateway_id || "unknown");
+    const batchId = batch.batch_id || `batch_${Date.now()}`;
+    const batchHash = batch.batch_hash || "NONE";
+
+    console.log(`[SERVER] Received batch ${batchId} (${batch.batch_size} logs) from ${gatewayId}`);
+    console.log(`[SERVER] Batch hash: ${batchHash.substring(0, 16)}...`);
+
+    // Append to JSONL file (append-only, corruption-resistant)
+    appendLogs(batch.logs, gatewayId, batchId, batchHash);
+
+    // Prune if needed (every 10th batch)
+    if (Math.random() < 0.1) {
+        pruneLogs(1000);
+    }
+
+    // Track heartbeats for each device in the batch
+    batch.logs.forEach(log => {
+        if (log.device_id) {
+            deviceHeartbeats[log.device_id] = Date.now();
+        }
+    });
+
+    // Forward to ML Engine for real-time threat detection
+    const ML_URL = "http://localhost:5001/predict/comprehensive";
+
+    batch.logs.forEach(log => {
+        axios.post(ML_URL, {
+            ...log,
+            batch_hash: batchHash,
+            gateway_id: gatewayId
+        }).catch(err => {
+            console.error(`[SERVER] Failed to forward to ML Engine: ${err.message}`);
+        });
+    });
+
+    // Phase 4: Log to Blockchain (Audit Trail)
+    // We log the batch metadata to blockchain to create a permanent record of the transmission
+    const firstLog = batch.logs[0] || {};
+    const deviceId = firstLog.device_id || "unknown";
+
+    callBlockchainPython('log_event', [
+        deviceId,
+        1.0,  // Normal score
+        crypto_hash(JSON.stringify(batch.logs)), // Data hash
+        batchHash,
+        "BATCH_RECEIPT",
+        gatewayId
+    ]).then(result => {
+        console.log(`[BLOCKCHAIN] Batch ${batchId} audit logged: ${result.tx_hash}`);
+    }).catch(err => {
+        console.error(`[BLOCKCHAIN] Failed to log batch audit: ${err.message}`);
+    });
+
+    res.json({ status: "success", count: batch.batch_size, batch_id: batchId });
+});
+
+// Helper for simple hashing
+const crypto = require('crypto');
+const crypto_hash = (data) => crypto.createHash('sha256').update(data).digest('hex');
+
+// API: Security Alerts (from Gateway reject)
+app.post('/api/alerts', (req, res) => {
+    const alert = req.body;
+    console.log(`[SECURITY] ALERT: ${alert.reason || 'Anomaly'} for device ${alert.device_id}`);
+
+    // Also save to standard logs so dashboard picks it up
+    const enrichedAlert = {
+        ...alert,
+        event_type: 'SECURITY_ALERT',
+        server_received_at: Date.now()
+    };
+    fs.appendFileSync(JSONL_FILE, JSON.stringify(enrichedAlert) + '\n');
+
+    // --- AUTOMATED ALERTING (WEBHOOK) ---
+    sendAlertWebhook(enrichedAlert);
+
+    // Update in-memory cache so Dashboard sees it immediately
+    recentLogs.push(enrichedAlert);
+    if (recentLogs.length > MAX_CACHE_SIZE) {
+        recentLogs.shift();
+    }
+
+    // --- EMIT REAL-TIME WEBSOCKET EVENT ---
+    io.emit('new_alert', enrichedAlert);
+
+    // Log to blockchain as a security threat
+    callBlockchainPython('log_event', [
+        alert.device_id,
+        0.0, // Zero trust for security threats
+        crypto_hash(JSON.stringify(alert)),
+        "GW_REJECTION",
+        "SECURITY_ALERT",
+        alert.gateway_id || "gateway_edge"
+    ]).then(result => {
+        console.log(`[BLOCKCHAIN] Security alert logged: ${result.tx_hash}`);
+    }).catch(err => {
+        console.error(`[BLOCKCHAIN] Failed to log security alert: ${err.message}`);
+    });
+
+    res.json({ status: "alert_received" });
+});
+
+// ==================== WEBHOOK INTEGRATION ====================
+// Used for Discord / Slack / Telegram etc
+const WEBHOOK_URL = process.env.WEBHOOK_URL || "";
+
+const sendAlertWebhook = async (alert) => {
+    if (!WEBHOOK_URL) return; // Silent skip if no webhook configured
+
+    try {
+        const payload = {
+            content: `🚨 **CRITICAL IOT SECURITY ALERT** 🚨\n**Device:** \`${alert.device_id}\`\n**Reason:** ${alert.reason || 'Unknown Anomaly'}\n**Gateway:** \`${alert.gateway_id || 'unknown'}\`\n**Time:** <t:${Math.floor(Date.now() / 1000)}:f>`
+        };
+        await axios.post(WEBHOOK_URL, payload);
+        console.log(`[ALERTING] Webhook dispatched successfully for ${alert.device_id}`);
+    } catch (err) {
+        console.error(`[ALERTING] Failed to dispatch webhook: ${err.message}`);
+    }
+};
+
+// API: Base Station Alarm Control
+app.post('/api/alarm/trigger', (req, res) => {
+    const { reason } = req.body;
+    isAlarmActive = true;
+    alarmReason = reason || "Unspecified Anomaly";
+    console.log('\n🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨');
+    console.log(`🚨 BASE STATION ALARM ACTIVE: ${alarmReason} 🚨`);
+    console.log('🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨\n');
+
+    io.emit('alarm_state_change', { active: true, reason: alarmReason });
+
+    res.json({ status: "alarm_triggered", reason: alarmReason });
+});
+
+app.post('/api/alarm/reset', (req, res) => {
+    isAlarmActive = false;
+    alarmReason = "";
+    console.log('✅ Base Station Alarm Reset.');
+
+    io.emit('alarm_state_change', { active: false, reason: "" });
+
+    res.json({ status: "alarm_reset" });
+});
+
+app.get('/api/alarm/status', (req, res) => {
+    res.json({ active: isAlarmActive, reason: alarmReason });
+});
+
+// API: Get Logs (for Frontend/ML)
+app.get('/api/logs', (req, res) => {
+    // FAST PATH: Serve from memory
+    const limit = parseInt(req.query.limit) || 50;
+
+    // If cache not initialized (fresh start), seed with only RECENT entries (last 2 min)
+    // Old sessions' data stays in the JSONL file for audit but doesn't pollute the live dashboard
+    if (!cacheInitialized) {
+        cacheInitialized = true;
+        const cutoff = Date.now() - 120000; // 2 minutes ago
+        recentLogs = readLogs()
+            .filter(log => (log.server_received_at || (log.timestamp * 1000)) > cutoff)
+            .slice(-MAX_CACHE_SIZE);
+        console.log(`[SERVER] Cache initialized with ${recentLogs.length} recent entries (filtered from JSONL)`);
+    }
+
+    const limitedLogs = recentLogs.slice(-limit);
+    res.json(limitedLogs);
+});
+
+// API: Device Control - Blockchain-Secured (Optimized)
+app.post('/api/control', async (req, res) => {
+    const { device_id, command, user_id = "dashboard_user" } = req.body;
+
+    // 1. Check Trust Cache (Instant Path)
+    const now = Date.now();
+    const cached = trustScoreCache[device_id];
+    let isTrusted = false;
+    let trustScore = 0;
+
+    if (cached && (now - cached.timestamp < TRUST_CACHE_TTL)) {
+        trustScore = cached.score;
+        if (trustScore >= 30) {
+            isTrusted = true;
+            console.log(`[CONTROL] ⚡ Instant Cache Hit for ${device_id} (Score: ${trustScore})`);
+        }
+    }
+
+    // 2. Logic Flow
+    if (isTrusted) {
+        // --- OPTIMISTIC FAST PATH ---
+
+        // A. Send to Gateway Immediately
+        try {
+            await axios.post('http://192.168.1.161:8090/control', {
+                device_id,
+                command,
+                command_id: `cmd_${now}_fast`
+            });
+
+            // B. Respond to Dashboard Immediately
+            res.json({
+                status: "command_forwarded_optimistic",
+                device_id,
+                command,
+                note: "Executed instantly using cached trust score"
+            });
+
+            // C. Log to Blockchain Asynchronously (Background)
+            callBlockchainPython('request_control', [device_id, user_id, command])
+                .then(result => {
+                    if (!result.approved) {
+                        console.warn(`[CONTROL] ⚠ Async verification failed! Trust dropped to ${result.trust_score}`);
+                        // In a real system, we might trigger an alarm or revoke cache here
+                        delete trustScoreCache[device_id];
+                    } else {
+                        // Refresh cache with latest score
+                        trustScoreCache[device_id] = { score: result.trust_score, timestamp: Date.now() };
+                        console.log(`[BLOCKCHAIN] Async log confirmed. New Score: ${result.trust_score}`);
+                    }
+                })
+                .catch(err => console.error(`[BLOCKCHAIN] Async logging failed: ${err.message}`));
+
+        } catch (e) {
+            console.error(`[CONTROL] Gateway unreachable: ${e.message}`);
+            res.status(500).json({ error: "Gateway unreachable" });
+        }
+
+    } else {
+        // --- SLOW VERIFICATION PATH (Cache Miss or Untrusted) ---
+        console.log(`[CONTROL] 🐢 Cache miss/low score for ${device_id}, performing full blockchain verification...`);
+
+        try {
+            const blockchainResult = await callBlockchainPython('request_control', [device_id, user_id, command]);
+
+            if (!blockchainResult.approved) {
+                console.log(`[CONTROL] ⚠ Command REJECTED - Trust score too low: ${blockchainResult.trust_score}`);
+                return res.status(403).json({
+                    status: "rejected",
+                    reason: "Trust score too low",
+                    trust_score: blockchainResult.trust_score
+                });
+            }
+
+            // Update Cache
+            trustScoreCache[device_id] = { score: blockchainResult.trust_score, timestamp: Date.now() };
+            console.log(`[CONTROL] ✓ Approved & Cached. Score: ${blockchainResult.trust_score}`);
+
+            // Forward to Gateway
+            await axios.post('http://192.168.1.161:8090/control', {
+                device_id,
+                command,
+                command_id: blockchainResult.command_id
+            });
+
+            res.json({
+                status: "command_forwarded_verified",
+                device_id,
+                command,
+                blockchain: blockchainResult
+            });
+
+        } catch (e) {
+            console.error(`[CONTROL] Verification failed: ${e.message}`);
+            res.status(500).json({ error: "Verification process failed" });
+        }
+    }
+});
+
+// Initialize empty JSONL file if not exists
+if (!fs.existsSync(JSONL_FILE) && !fs.existsSync(LOG_FILE)) {
+    fs.writeFileSync(JSONL_FILE, '');
+}
+
+// ==================== BLOCKCHAIN API ENDPOINTS ====================
+
+const { spawn } = require('child_process');
+
+const blockchainQueue = [];
+let isBlockchainActive = false;
+
+const processBlockchainQueue = async () => {
+    if (isBlockchainActive || blockchainQueue.length === 0) return;
+
+    isBlockchainActive = true;
+    const { functionName, args, resolve, reject } = blockchainQueue.shift();
+
+    try {
+        const result = await executeBlockchainPython(functionName, args);
+        resolve(result);
+    } catch (err) {
+        reject(err);
+    } finally {
+        isBlockchainActive = false;
+        // Process next in queue
+        processBlockchainQueue();
+    }
+};
+
+const callBlockchainPython = (functionName, args = []) => {
+    return new Promise((resolve, reject) => {
+        blockchainQueue.push({ functionName, args, resolve, reject });
+        processBlockchainQueue();
+    });
+};
+
+// Helper to call Python blockchain functions (using the CLI handler in the script)
+const executeBlockchainPython = (functionName, args = []) => {
+    return new Promise((resolve, reject) => {
+        const baseDir = path.join(__dirname, '..');
+        const blockchainDir = path.join(baseDir, 'blockchain');
+        const scriptPath = path.join(blockchainDir, 'deploy_and_interact.py');
+
+        // Robust Python Detection: Prefer local .venv if it exists
+        const venvPython = process.platform === 'win32'
+            ? path.join(baseDir, '.venv', 'Scripts', 'python.exe')
+            : path.join(baseDir, '.venv', 'bin', 'python');
+
+        const pythonExe = fs.existsSync(venvPython) ? venvPython : 'python';
+
+        // Prepare arguments: [scriptPath, functionName, ...args]
+        // Note: args need to be converted to strings for CLI
+        const pythonArgs = [scriptPath, functionName, ...args.map(a => String(a))];
+
+        const python = spawn(pythonExe, pythonArgs, {
+            cwd: blockchainDir,
+            env: { ...process.env }
+        });
+
+        let output = '';
+        let error = '';
+
+        // Added 15-second timeout to prevent zombie processes
+        const timeout = setTimeout(() => {
+            python.kill();
+            reject(new Error(`Python process timed out after 15s (${functionName})`));
+        }, 15000);
+
+        python.stdout.on('data', (data) => {
+            output += data.toString();
+        });
+
+        python.stderr.on('data', (data) => {
+            error += data.toString();
+        });
+
+        python.on('close', (code) => {
+            clearTimeout(timeout);
+            // isBlockchainActive handled by processBlockchainQueue wrap
+            if (code === 0) {
+                try {
+                    const parsed = JSON.parse(output.trim());
+                    if (parsed && parsed.error) {
+                        reject(new Error(parsed.error));
+                    } else {
+                        resolve(parsed);
+                    }
+                } catch (e) {
+                    resolve(output.trim());
+                }
+            } else {
+                reject(new Error(error || 'Python script failed'));
+            }
+        });
+    });
+};
+
+// Blockchain Cache
+let blockchainCache = { data: [], timestamp: 0 };
+const BLOCKCHAIN_CACHE_TTL = 10000; // 10 seconds
+
+// API: Get all blockchain logs
+app.get('/api/blockchain/logs', async (req, res) => {
+    try {
+        const now = Date.now();
+        const limit = parseInt(req.query.limit) || 100;
+
+        // Serve from cache if fresh
+        if (now - blockchainCache.timestamp < BLOCKCHAIN_CACHE_TTL && blockchainCache.data.length > 0) {
+            return res.json(blockchainCache.data.slice(0, limit));
+        }
+
+        // Fetch fresh if cache expired (and update cache)
+        // Note: To avoid queuing 100 requests at once, we should ideally use a "refreshing" flag, 
+        // but for now, the queue system handles serialization. 
+        // We just need to ensure we don't start a new fetch if one is recent.
+
+        // Optimistic return if cache exists but is slightly stale (to prevent UI blocking)
+        if (blockchainCache.data.length > 0) {
+            // Trigger background update if not too frequent
+            callBlockchainPython('get_all_logs', [limit]).then(logs => {
+                blockchainCache = { data: logs, timestamp: Date.now() };
+            }).catch(e => console.error("BG Blockchain update failed:", e.message));
+
+            return res.json(blockchainCache.data.slice(0, limit));
+        }
+
+        // First time fetch (blocking)
+        const logs = await callBlockchainPython('get_all_logs', [limit]);
+        blockchainCache = { data: logs, timestamp: Date.now() };
+        res.json(logs);
+
+    } catch (error) {
+        console.error('[BLOCKCHAIN] Error getting logs:', error.message);
+        // Fallback to cache on error
+        if (blockchainCache.data.length > 0) {
+            return res.json(blockchainCache.data);
+        }
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// API: Get blockchain log count
+app.get('/api/blockchain/count', async (req, res) => {
+    try {
+        const count = await callBlockchainPython('get_log_count');
+        res.json({ count: count });
+    } catch (error) {
+        console.error('[BLOCKCHAIN] Error getting count:', error.message);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// API: Get trust score for a device
+app.get('/api/blockchain/trust/:deviceId', async (req, res) => {
+    try {
+        const deviceId = req.params.deviceId;
+        const score = await callBlockchainPython('get_trust_score', [deviceId]);
+        res.json({ device_id: deviceId, trust_score: score });
+    } catch (error) {
+        console.error('[BLOCKCHAIN] Error getting trust score:', error.message);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// API: Get command history for a device
+app.get('/api/control/history/:deviceId', async (req, res) => {
+    try {
+        const deviceId = req.params.deviceId;
+        const limit = parseInt(req.query.limit) || 50;
+        const history = await callBlockchainPython('get_command_history', [deviceId, limit]);
+        res.json(history);
+    } catch (error) {
+        console.error('[BLOCKCHAIN] Error getting command history:', error.message);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// API: Get all command history (no device filter)
+app.get('/api/control/history', async (req, res) => {
+    try {
+        const limit = parseInt(req.query.limit) || 50;
+        const history = await callBlockchainPython('get_command_history', [null, limit]);
+        res.json(history);
+    } catch (error) {
+        console.error('[BLOCKCHAIN] Error getting command history:', error.message);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ==================== DEVICE REGISTRY API ====================
+
+app.get('/api/devices', (req, res) => {
+    if (fs.existsSync(DEVICES_FILE)) {
+        res.json(JSON.parse(fs.readFileSync(DEVICES_FILE, 'utf8')));
+    } else {
+        res.json([]);
+    }
+});
+
+// Real-time device verification for gateway hybrid auth
+app.get('/api/devices/verify/:deviceId/:userId', (req, res) => {
+    const { deviceId, userId } = req.params;
+
+    if (!fs.existsSync(DEVICES_FILE)) {
+        return res.json({ authorized: false, reason: "No device registry" });
+    }
+
+    const devices = JSON.parse(fs.readFileSync(DEVICES_FILE, 'utf8'));
+
+    // Check exact match first
+    let device = devices.find(d => d.id === deviceId);
+
+    // Check base ID match (e.g., esp8266_env_01 for esp8266_env_01_d969)
+    if (!device) {
+        const baseId = deviceId.split("_").slice(0, 3).join("_");
+        device = devices.find(d => d.id === baseId);
+    }
+
+    if (!device) {
+        return res.json({ authorized: false, reason: "Device not registered" });
+    }
+
+    if (device.user_id !== userId) {
+        return res.json({ authorized: false, reason: "User not authorized for device" });
+    }
+
+    res.json({ authorized: true, device: device });
+});
+
+app.post('/api/devices', async (req, res) => {
+    const newDevice = req.body;
+    let devices = [];
+    if (fs.existsSync(DEVICES_FILE)) {
+        devices = JSON.parse(fs.readFileSync(DEVICES_FILE, 'utf8'));
+    }
+
+    // Check if device already exists
+    if (devices.find(d => d.id === newDevice.id)) {
+        return res.status(400).json({ error: "Device ID already exists" });
+    }
+
+    devices.push(newDevice);
+    fs.writeFileSync(DEVICES_FILE, JSON.stringify(devices, null, 2));
+
+    // Log to blockchain as a security event (Registration)
+    callBlockchainPython('register_device', [
+        newDevice.id,
+        "IOT_SENSOR",
+        "server_admin"
+    ]).then(result => {
+        console.log(`[BLOCKCHAIN] Device ${newDevice.id} registered on-chain: ${result.tx_hash}`);
+
+        // Also log the initial registration event
+        callBlockchainPython('log_event', [
+            newDevice.id,
+            1.0,
+            crypto_hash(JSON.stringify(newDevice)),
+            "NEW_DEVICE_REG",
+            "REGISTRATION",
+            "server_admin"
+        ]);
+    });
+
+    // Notify Gateway to sync immediately
+    try {
+        await axios.post('http://localhost:8090/api/sync', { reason: "NEW_DEVICE", device_id: newDevice.id });
+        console.log('[GATEWAY] Notified to sync registry');
+    } catch (e) {
+        console.warn('[GATEWAY] Notification failed (unreachable?):', e.message);
+    }
+
+    res.json({ status: "success", device: newDevice });
+});
+
+app.post('/api/devices/:deviceId/unquarantine', async (req, res) => {
+    const { deviceId } = req.params;
+
+    if (!fs.existsSync(DEVICES_FILE)) return res.status(404).json({ error: "Registry not found" });
+
+    let devices = JSON.parse(fs.readFileSync(DEVICES_FILE, 'utf8'));
+    let device = devices.find(d => d.id === deviceId);
+
+    if (!device) return res.status(404).json({ error: "Device not found" });
+
+    // Remote local quarantine flag
+    device.quarantined = false;
+    fs.writeFileSync(DEVICES_FILE, JSON.stringify(devices, null, 2));
+
+    // Restore Trust Score on Blockchain (Async, don't block response)
+    try {
+        callBlockchainPython('log_event', [
+            deviceId,
+            1.0,  // Full trust restoration
+            crypto_hash(`UNQUARANTINE_${Date.now()}`),
+            "UNQUARANTINE",
+            "ADMIN_OVERRIDE",
+            "server_admin"
+        ]).catch(() => { });
+
+        // Clear local cache
+        delete trustScoreCache[deviceId];
+
+        // Notify gateway to drop the blacklist (Async)
+        axios.post('http://localhost:8090/api/sync', { reason: "UNQUARANTINE", device_id: deviceId }).catch(() => { });
+
+        res.json({ status: "success", message: `Device ${deviceId} un-quarantined and trust restored.` });
+    } catch (e) {
+        res.status(500).json({ error: "Failed to update internal state: " + e.message });
+    }
+});
+
+// ==================== OTA FIRMWARE ORCHESTRATION ====================
+
+// Serve firmware files securely
+app.get('/api/ota/firmware/:version', (req, res) => {
+    const { version } = req.params;
+    // Basic sanitization
+    const sanitizeVersion = version.replace(/[^a-zA-Z0-9.\-_]/g, '');
+    const filePath = path.join(__dirname, 'firmware', `${sanitizeVersion}`);
+
+    if (fs.existsSync(filePath)) {
+        res.download(filePath);
+    } else {
+        res.status(404).json({ error: "Firmware version not found" });
+    }
+});
+
+// Trigger OTA update for a device
+app.post('/api/devices/:deviceId/update', async (req, res) => {
+    const { deviceId } = req.params;
+    const { version } = req.body;
+
+    if (!version) {
+        return res.status(400).json({ error: "Target firmware version required" });
+    }
+
+    try {
+        console.log(`[OTA] Initiating Firmware Update (${version}) for ${deviceId}`);
+
+        // Ensure command gets to gateway
+        await axios.post('http://localhost:8090/control', {
+            device_id: deviceId,
+            command: `OTA_UPDATE|${version}`,
+            command_id: `ota_${Date.now()}`
+        });
+
+        // Log initiation on blockchain
+        callBlockchainPython('log_event', [
+            deviceId,
+            1.0,
+            crypto_hash(`OTA_UPDATE|${version}`),
+            "OTA_INIT",
+            "FIRMWARE_UPDATE",
+            req.user ? req.user.username : "server_admin"
+        ]).catch(() => { });
+
+        res.json({ status: "ota_initiated", device: deviceId, version });
+
+    } catch (err) {
+        console.error(`[OTA] Failed to send update command to gateway: ${err.message}`);
+        res.status(500).json({ error: "Failed to communicate with gateway" });
+    }
+});
+
+// ==================== SYSTEM HEALTH MONITOR ====================
+
+app.get('/api/health', (req, res) => {
+    const now = Date.now();
+    const health = Object.entries(deviceHeartbeats).map(([id, lastSeen]) => ({
+        device_id: id,
+        last_seen: lastSeen,
+        status: (now - lastSeen < HEARTBEAT_TIMEOUT) ? "online" : "stale",
+        seconds_ago: Math.floor((now - lastSeen) / 1000)
+    }));
+    res.json(health);
+});
+
+// Periodic check for dead devices
+setInterval(() => {
+    const now = Date.now();
+    Object.entries(deviceHeartbeats).forEach(([id, lastSeen]) => {
+        if (now - lastSeen > HEARTBEAT_TIMEOUT && now - lastSeen < HEARTBEAT_TIMEOUT + 5000) {
+            console.log(`[HEALTH] ALERT: Device ${id} has gone STALE!`);
+            // Log this to blockchain!
+            callBlockchainPython('log_event', [
+                id, 0.5, crypto_hash(id + now), "HEARTBEAT_LOST", "HEALTH_ALERT", "server_monitor"
+            ]).catch(() => { });
+        }
+    });
+}, 5000);
+
+// ==================== AUTO-QUARANTINE (PHASE 7) ====================
+const QUARANTINE_THRESHOLD = 50;
+
+setInterval(async () => {
+    if (!fs.existsSync(DEVICES_FILE)) return;
+
+    try {
+        let devices = JSON.parse(fs.readFileSync(DEVICES_FILE, 'utf8'));
+        let registryUpdated = false;
+
+        for (let i = 0; i < devices.length; i++) {
+            const dev = devices[i];
+
+            // Fetch live blockchain trust score
+            const score = await callBlockchainPython('get_trust_score', [dev.id]);
+
+            if (score < QUARANTINE_THRESHOLD && !dev.quarantined) {
+                console.log(`\n🛑 [QUARANTINE] Threat Detected! Trust score for ${dev.id} plummeted to ${score}. Initiating auto-isolation...`);
+
+                // 1. Mark as quarantined locally
+                dev.quarantined = true;
+                registryUpdated = true;
+
+                // 2. Transmit kill-switch to device
+                try {
+                    await axios.post('http://localhost:8090/control', {
+                        device_id: dev.id,
+                        command: 'DEVICE_OFF',
+                        command_id: `quarantine_${Date.now()}`
+                    });
+                    console.log(`🛑 [QUARANTINE] Sent DEVICE_OFF kill-switch to ${dev.id}.`);
+                } catch (e) {
+                    console.log(`🛑 [QUARANTINE] Failed to send kill-switch to Gateway: ${e.message}`);
+                }
+
+                // 3. Webhook Alert
+                sendAlertWebhook({
+                    device_id: dev.id,
+                    reason: `AUTO-ISOLATED due to Critical Trust Score (${score}%)`
+                });
+            }
+        }
+
+        if (registryUpdated) {
+            fs.writeFileSync(DEVICES_FILE, JSON.stringify(devices, null, 2));
+            console.log(`[QUARANTINE] Device registry updated with quarantined statuses.`);
+        }
+    } catch (e) {
+        console.error(`[QUARANTINE] Monitor error: ${e.message}`);
+    }
+}, 30000); // Check every 30 seconds
+
+// Use the wrapped HTTP server instead of the raw Express app
+server.listen(PORT, () => {
+    console.log(`Server running on http://localhost:${PORT} (HTTP + WebSockets)`);
+    console.log('Blockchain API endpoints:');
+    console.log('  GET /api/blockchain/logs - Get all anomaly logs');
+    console.log('  GET /api/blockchain/count - Get log count');
+    console.log('  GET /api/blockchain/trust/:deviceId - Get device trust score');
+    console.log('  POST /api/control - Blockchain-secured device control');
+    console.log('  GET /api/control/history/:deviceId - Get command history');
+    console.log('Device Registry endpoints:');
+    console.log('  GET /api/devices - List devices');
+    console.log('  POST /api/devices - Add device');
+});
